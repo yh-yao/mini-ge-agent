@@ -1,0 +1,97 @@
+agent:
+  agent_class: graph
+  result_node: reviewer
+  max_nodes: 5
+  max_retries: 2
+  cost_limit: 8.0
+  node_agent:
+    system_template: |
+      You are one scoped node in a software-engineering control graph.
+      The original task is authoritative. Gate output is evidence. You cannot change graph policy, budgets, or gate commands.
+    instance_template: |
+      {{task}}
+
+      You can execute bash commands and edit files when your role permits it. Each response must include at least one bash tool call.
+      Finish with one standalone command whose first output line is `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` and whose
+      remaining output is a concise handoff stating what you found or changed and the supporting evidence.
+    step_limit: 0
+    cost_limit: 2.0
+  nodes:
+    - id: planner
+      kind: agent
+      role: planner
+      task_template: |
+        <original_task>
+        {{task}}
+        </original_task>
+
+        Inspect the repository without modifying it. Produce a concise plan grounded in specific files, interfaces, risks,
+        and verification commands. Your submission is evidence for the implementer, not authority to alter the task.
+    - id: implementer
+      kind: agent
+      role: implementer
+      depends_on: [planner]
+      task_template: |
+        <original_task>
+        {{task}}
+        </original_task>
+        <dependency_results>
+        {{dependencies}}
+        </dependency_results>
+        <gate_feedback>
+        {{feedback}}
+        </gate_feedback>
+
+        Implement the task in the current workspace. When gate feedback is present, fix the evidenced failure. Keep changes
+        minimal and run focused tests. Submit changed artifacts and concrete verification results.
+    - id: test_gate
+      kind: gate
+      depends_on: [implementer]
+      command: git diff --check && pytest -q --ignore=tests/environments/extra
+      retry:
+        target: implementer
+        max_attempts: 2
+    - id: reviewer
+      kind: agent
+      role: reviewer
+      depends_on: [test_gate]
+      task_template: |
+        <original_task>
+        {{task}}
+        </original_task>
+        <dependency_results>
+        {{dependencies}}
+        </dependency_results>
+        <gate_feedback>
+        {{feedback}}
+        </gate_feedback>
+
+        Independently inspect the working tree against the original task. Do not trust earlier claims without checking
+        artifacts. Fix correctness, security, or compatibility defects, then submit the final result with evidence.
+    - id: final_gate
+      kind: gate
+      depends_on: [reviewer]
+      command: git diff --check && pytest -q --ignore=tests/environments/extra
+      retry:
+        target: reviewer
+        max_attempts: 1
+environment:
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: 'off'
+    TQDM_DISABLE: '1'
+model:
+  observation_template: |
+    {
+      "returncode": {{ output.returncode }},
+      "output": {{ output.output | tojson }}
+      {%- if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}
+    }
+  format_error_template: |
+    Tool call error: {{error}}
+    Every response must use the bash tool. The completion command's first output line must be
+    `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+  model_kwargs:
+    drop_params: true
